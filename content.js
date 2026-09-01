@@ -2,6 +2,18 @@
   const DOWNLOAD_ICON_SVG =
     '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>';
 
+  function dedupeByUrl(results) {
+    const seen = new Set();
+    const deduped = [];
+    for (const r of results) {
+      if (r.url && !seen.has(r.url)) {
+        seen.add(r.url);
+        deduped.push(r);
+      }
+    }
+    return deduped;
+  }
+
   function extractVideoVersions(html) {
     const results = [];
     const re = /"video_versions":\s*(\[[^\]]*\])/g;
@@ -18,14 +30,7 @@
         // skip malformed fragment
       }
     }
-    const seen = new Set();
-    const deduped = [];
-    for (const r of results) {
-      if (!seen.has(r.url)) {
-        seen.add(r.url);
-        deduped.push(r);
-      }
-    }
+    const deduped = dedupeByUrl(results);
     // Some responses (e.g. reels) omit width/height and only differ by an
     // opaque "type" ranking; Instagram already lists those best-first, so
     // only re-sort when real dimensions are available to sort by.
@@ -35,14 +40,111 @@
     return deduped;
   }
 
-  async function fetchQualitiesForInfo(info) {
-    if (info.href === location.href) {
-      const domQ = extractVideoVersions(document.documentElement.outerHTML);
-      if (domQ.length) return domQ;
+  // Fallback for pages that never got video_versions embedded (e.g. a
+  // fresh, non-hydrated fetch of a post that isn't the currently open one -
+  // Instagram's server-rendered HTML doesn't include video_versions at all,
+  // only the client hydrates it into the DOM). og:video is server-rendered
+  // for link-preview crawlers, and the embed page renders a plain <video
+  // src> with no client JS required, so both are reachable without
+  // depending on hydration state.
+  function extractFallbackVideoUrls(html) {
+    const results = [];
+    const metaRe = /<meta[^>]+property="og:video(?::secure_url)?"[^>]+content="([^"]+)"/g;
+    let m;
+    while ((m = metaRe.exec(html)) !== null) {
+      results.push({ url: m[1].replace(/&amp;/g, "&"), width: 0, height: 0 });
     }
-    const res = await fetch(info.href, { credentials: "include" });
-    const html = await res.text();
-    return extractVideoVersions(html);
+    const videoTagRe = /<video[^>]*\ssrc="(https:[^"]+)"/g;
+    while ((m = videoTagRe.exec(html)) !== null) {
+      results.push({ url: m[1].replace(/&amp;/g, "&"), width: 0, height: 0 });
+    }
+    const videoUrlFieldRe = /"video_url":"([^"]+)"/g;
+    while ((m = videoUrlFieldRe.exec(html)) !== null) {
+      try {
+        results.push({ url: JSON.parse(`"${m[1]}"`), width: 0, height: 0 });
+      } catch (e) {
+        // skip malformed escape sequence
+      }
+    }
+    return dedupeByUrl(results);
+  }
+
+  // Instagram's video_versions blocks belong to whichever post/reel object
+  // they're embedded in; when the DOM has data for several hydrated posts
+  // at once, narrow the search to the region around this post's own
+  // "code" field so we don't accidentally grab a neighboring post's video.
+  function scopeHtmlToCode(html, code) {
+    if (!code) return html;
+    const idx = html.indexOf(`"code":"${code}"`);
+    if (idx === -1) return html;
+    const start = Math.max(0, idx - 20000);
+    const end = Math.min(html.length, idx + 20000);
+    return html.slice(start, end);
+  }
+
+  function extractQualitiesFromHtml(html, code) {
+    const scoped = scopeHtmlToCode(html, code);
+    let q = extractVideoVersions(scoped);
+    if (q.length) return q;
+    q = extractVideoVersions(html);
+    if (q.length) return q;
+    return extractFallbackVideoUrls(html);
+  }
+
+  // Last-resort fallback: Instagram's player streams video over MSE using
+  // a blob: URL, so the <video> element's own src is never a real file -
+  // but the actual .mp4 segment(s) still go out as real network requests,
+  // visible in the Resource Timing API regardless of whether Instagram
+  // exposes them in any parseable JSON. Only safe to use when the video in
+  // this specific container is the one actually playing right now, since
+  // otherwise the most-recent network activity could belong to a
+  // different post entirely.
+  function extractFromNetworkActivity(container) {
+    const video = container && container.querySelector("video");
+    if (!video || video.paused || video.currentTime <= 0) return [];
+    try {
+      const entries = performance.getEntriesByType("resource");
+      const candidates = entries.filter(
+        (e) => /\.mp4(\?|$)/i.test(e.name) || /\/v\/t2\//.test(e.name)
+      );
+      candidates.sort((a, b) => b.responseEnd - a.responseEnd);
+      const seen = new Set();
+      const results = [];
+      for (const e of candidates) {
+        if (seen.has(e.name)) continue;
+        seen.add(e.name);
+        results.push({ url: e.name, width: 0, height: 0 });
+        if (results.length >= 5) break;
+      }
+      return results;
+    } catch (e) {
+      return [];
+    }
+  }
+
+  async function fetchQualitiesForInfo(info, container) {
+    // 1) Whatever's already hydrated in the current page's DOM - covers
+    // the common case where the icon being clicked belongs to a post/reel
+    // that's actually rendered on screen right now.
+    let q = extractQualitiesFromHtml(document.documentElement.outerHTML, info.code);
+    if (q.length) return q;
+
+    // 2) A fresh fetch of the post's own page. Instagram's server-rendered
+    // HTML doesn't always include video_versions (client hydration adds
+    // it), so this only helps for post types that do SSR it, but it's a
+    // free thing to try.
+    try {
+      const res = await fetch(info.href, { credentials: "include" });
+      const html = await res.text();
+      q = extractQualitiesFromHtml(html, info.code);
+      if (q.length) return q;
+    } catch (e) {
+      console.error("IGDL: direct page fetch failed", e);
+    }
+
+    // 3) Network activity for the currently-playing video in this
+    // container, as a last resort.
+    return extractFromNetworkActivity(container);
   }
 
   function findShortcodeInfo(container) {
@@ -53,11 +155,11 @@
       if (a) {
         const href = a.getAttribute("href");
         const m = href.match(/\/(p|reel|reels|tv)\/([^/?#]+)/);
-        if (m) return { code: m[2], href: new URL(href, location.origin).href };
+        if (m) return { type: m[1], code: m[2], href: new URL(href, location.origin).href };
       }
     }
     const m2 = location.pathname.match(/\/(p|reel|reels|tv)\/([^/]+)/);
-    if (m2) return { code: m2[2], href: location.href };
+    if (m2) return { type: m2[1], code: m2[2], href: location.href };
     return null;
   }
 
@@ -79,55 +181,74 @@
     return null;
   }
 
+  function getActionBarDirection(saveBtn) {
+    // Walk up until we find the ancestor whose parent holds several small,
+    // icon-button-sized children (Like/Comment/Share/Save/...) - that's the
+    // real action bar, as opposed to some inner single-icon centering
+    // wrapper closer by, or an outer card wrapper whose children are large
+    // structural blocks that merely happen to contain an svg somewhere.
+    let node = saveBtn;
+    for (let i = 0; i < 10 && node; i++) {
+      const parent = node.parentElement;
+      if (parent) {
+        const iconSiblings = Array.from(parent.children).filter((c) => {
+          if (!c.querySelector || !c.querySelector("svg")) return false;
+          const r = c.getBoundingClientRect();
+          return r.width > 0 && r.width < 60 && r.height < 60;
+        });
+        if (iconSiblings.length >= 3) {
+          return getComputedStyle(parent).flexDirection;
+        }
+      }
+      node = parent;
+    }
+    return "row";
+  }
+
   function removePanel() {
     const p = document.getElementById("igdl-panel");
     if (p) p.remove();
   }
 
+  // Instagram's own menus (the "..." dropdown, share sheet, etc.) are dark
+  // by default but respect a light-theme opt-in; sample the page itself
+  // instead of guessing from prefers-color-scheme, since IG's theme choice
+  // isn't necessarily tied to the OS setting.
+  function isDarkTheme() {
+    const bg = getComputedStyle(document.body).backgroundColor;
+    const m = bg.match(/\d+/g);
+    if (!m) return true;
+    const [r, g, b] = m.map(Number);
+    return (r + g + b) / 3 < 128;
+  }
+
   function showPanel(qualities, code, triggerEl) {
     removePanel();
+    const dark = isDarkTheme();
+
     const panel = document.createElement("div");
     panel.id = "igdl-panel";
+    panel.className = dark ? "igdl-theme-dark" : "igdl-theme-light";
 
-    const closeBtn = document.createElement("button");
-    closeBtn.type = "button";
-    closeBtn.textContent = "✕";
-    closeBtn.className = "igdl-close-btn";
-    closeBtn.addEventListener("click", removePanel);
-    panel.appendChild(closeBtn);
-
-    const title = document.createElement("div");
-    title.className = "igdl-panel-title";
-    title.textContent = "Select quality";
-    panel.appendChild(title);
-
-    const select = document.createElement("select");
-    select.id = "igdl-quality-select";
     qualities.forEach((q, i) => {
-      const opt = document.createElement("option");
-      opt.value = String(i);
-      const dims = q.width && q.height ? `${q.width}x${q.height}` : `Quality ${i + 1}`;
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "igdl-option";
+      const dims = q.width && q.height ? `${q.width} × ${q.height}` : `Quality ${i + 1}`;
       let tag = "";
-      if (i === 0) tag = " (highest)";
-      else if (i === qualities.length - 1) tag = " (lowest)";
-      opt.textContent = dims + tag;
-      select.appendChild(opt);
+      if (qualities.length > 1) {
+        if (i === 0) tag = " · Best";
+        else if (i === qualities.length - 1) tag = " · Lowest";
+      }
+      row.textContent = dims + tag;
+      row.addEventListener("click", () => {
+        const label = q.width && q.height ? `${q.width}x${q.height}` : `q${i + 1}`;
+        const filename = `instagram_${code}_${label}.mp4`;
+        chrome.runtime.sendMessage({ type: "IGDL_DOWNLOAD", url: q.url, filename });
+        removePanel();
+      });
+      panel.appendChild(row);
     });
-    panel.appendChild(select);
-
-    const downloadBtn = document.createElement("button");
-    downloadBtn.type = "button";
-    downloadBtn.textContent = "Download";
-    downloadBtn.className = "igdl-download-btn";
-    downloadBtn.addEventListener("click", () => {
-      const idx = Number(select.value);
-      const q = qualities[idx];
-      const label = q.width && q.height ? `${q.width}x${q.height}` : `q${idx + 1}`;
-      const filename = `instagram_${code}_${label}.mp4`;
-      chrome.runtime.sendMessage({ type: "IGDL_DOWNLOAD", url: q.url, filename });
-      removePanel();
-    });
-    panel.appendChild(downloadBtn);
 
     document.body.appendChild(panel);
 
@@ -160,7 +281,7 @@
     triggerEl.classList.add("igdl-loading");
     let qualities = [];
     try {
-      qualities = await fetchQualitiesForInfo(info);
+      qualities = await fetchQualitiesForInfo(info, container);
     } catch (e) {
       console.error("IGDL: failed to fetch qualities", e);
     }
@@ -176,13 +297,22 @@
   function injectButtons() {
     const saveSvgs = document.querySelectorAll('svg[aria-label="Save"]');
     for (const svg of saveSvgs) {
+      const rect = svg.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue; // hidden/duplicate a11y clone
+
       const saveBtn = getClickableAncestor(svg);
-      if (!saveBtn || saveBtn.dataset.igdlProcessed) continue;
+      if (!saveBtn) continue;
+
+      // Live DOM check instead of a permanent flag: Instagram's React tree
+      // can re-render and strip our injected node on its own, and a flag
+      // left on saveBtn would then block us from ever re-adding it.
+      const sibling = saveBtn.nextElementSibling;
+      if (sibling && sibling.classList && sibling.classList.contains("igdl-inline-wrap")) {
+        continue;
+      }
 
       const container = findVideoContainer(saveBtn);
       if (!container) continue; // no nearby video -> likely an image-only post
-
-      saveBtn.dataset.igdlProcessed = "1";
 
       const wrap = document.createElement("div");
       wrap.className = "igdl-inline-wrap";
@@ -196,6 +326,7 @@
       const newSvg = wrap.querySelector("svg");
       if (themeColor) newSvg.style.color = themeColor;
 
+      wrap.addEventListener("mousedown", (e) => e.stopPropagation());
       wrap.addEventListener("click", (e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -204,11 +335,41 @@
       wrap.addEventListener("keydown", (e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
+          e.stopPropagation();
           onDownloadClick(wrap, container);
         }
       });
 
-      saveBtn.insertAdjacentElement("afterend", wrap);
+      const direction = getActionBarDirection(saveBtn);
+      const isColumn = direction.indexOf("column") !== -1;
+
+      if (isColumn) {
+        // Reels: plenty of vertical room in the icon rail, keep it in the
+        // normal flow right below Save and just give it breathing room.
+        wrap.classList.add("igdl-inline-wrap--column");
+        saveBtn.insertAdjacentElement("afterend", wrap);
+      } else {
+        // Posts/feed: the action row is width-constrained, so adding a 6th
+        // icon in normal flow can overflow and wrap the whole row onto a
+        // new line, pushing the caption down. Keep it a plain sibling
+        // (never a child of Instagram's own button - React can wipe
+        // injected children on re-render) but pull it out of flow and
+        // pin it to Save's own on-screen position so it can never affect
+        // the row's width.
+        wrap.classList.add("igdl-inline-wrap--row");
+        const parent = saveBtn.parentElement;
+        if (parent) {
+          if (getComputedStyle(parent).position === "static") {
+            parent.style.position = "relative";
+          }
+          const parentRect = parent.getBoundingClientRect();
+          const saveRect = saveBtn.getBoundingClientRect();
+          wrap.style.position = "absolute";
+          wrap.style.top = `${saveRect.top - parentRect.top + (saveRect.height - 40) / 2}px`;
+          wrap.style.left = `${saveRect.left - parentRect.left - 44}px`;
+        }
+        saveBtn.insertAdjacentElement("afterend", wrap);
+      }
     }
   }
 
