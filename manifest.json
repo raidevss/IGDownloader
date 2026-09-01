@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "IG Video Downloader",
+  "version": "1.0.0",
+  "description": "Adds a Save button to Instagram posts/reels to pick a quality and download the video.",
+  "permissions": ["downloads"],
+  "host_permissions": ["https://www.instagram.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.instagram.com/p/*",
+        "https://www.instagram.com/reel/*",
+        "https://www.instagram.com/reels/*",
+        "https://www.instagram.com/tv/*"
+      ],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
