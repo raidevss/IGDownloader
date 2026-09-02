@@ -2,6 +2,25 @@
   const DOWNLOAD_ICON_SVG =
     '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>';
 
+  // Populated by page-hook.js (runs in the page's own MAIN world) as it
+  // taps Instagram's real fetch/XHR responses. This is the only reliable
+  // source of a reel's video_versions once you've scrolled past whichever
+  // reel was present in the initial page load - Instagram never writes
+  // later reels' data back into the DOM/HTML text, so the outerHTML-based
+  // extraction below can only ever see stale/neighboring data for those.
+  const NETWORK_VIDEO_CACHE = new Map();
+  const NETWORK_VIDEO_CACHE_MAX = 50;
+  window.addEventListener("igdl-video-data", (e) => {
+    for (const { code, videoVersions } of e.detail) {
+      if (!code || !videoVersions || !videoVersions.length) continue;
+      if (NETWORK_VIDEO_CACHE.size >= NETWORK_VIDEO_CACHE_MAX && !NETWORK_VIDEO_CACHE.has(code)) {
+        const oldestKey = NETWORK_VIDEO_CACHE.keys().next().value;
+        NETWORK_VIDEO_CACHE.delete(oldestKey);
+      }
+      NETWORK_VIDEO_CACHE.set(code, videoVersions);
+    }
+  });
+
   function dedupeByUrl(results) {
     const seen = new Set();
     const deduped = [];
@@ -123,13 +142,24 @@
   }
 
   async function fetchQualitiesForInfo(info, container) {
-    // 1) Whatever's already hydrated in the current page's DOM - covers
+    // 1) A real network response tagged with this exact code, captured by
+    // page-hook.js as Instagram's own client fetched it. Checked first
+    // because it's authoritative - unlike outerHTML, it can't be stale or
+    // ambiguous between neighboring reels.
+    let cached = NETWORK_VIDEO_CACHE.get(info.code);
+    if (cached && cached.length) {
+      let q = dedupeByUrl(cached);
+      if (q.some((r) => r.width && r.height)) q.sort((a, b) => b.width * b.height - a.width * a.height);
+      if (q.length) return q;
+    }
+
+    // 2) Whatever's already hydrated in the current page's DOM - covers
     // the common case where the icon being clicked belongs to a post/reel
     // that's actually rendered on screen right now.
     let q = extractQualitiesFromHtml(document.documentElement.outerHTML, info.code);
     if (q.length) return q;
 
-    // 2) A fresh fetch of the post's own page. Instagram's server-rendered
+    // 3) A fresh fetch of the post's own page. Instagram's server-rendered
     // HTML doesn't always include video_versions (client hydration adds
     // it), so this only helps for post types that do SSR it, but it's a
     // free thing to try.
@@ -142,23 +172,49 @@
       console.error("IGDL: direct page fetch failed", e);
     }
 
-    // 3) Network activity for the currently-playing video in this
+    // 4) Network activity for the currently-playing video in this
     // container, as a last resort.
     return extractFromNetworkActivity(container);
   }
 
-  function findShortcodeInfo(container) {
-    if (container) {
-      const a = container.querySelector(
-        'a[href*="/p/"], a[href*="/reel/"], a[href*="/reels/"], a[href*="/tv/"]'
-      );
-      if (a) {
-        const href = a.getAttribute("href");
-        const m = href.match(/\/(p|reel|reels|tv)\/([^/?#]+)/);
-        if (m) return { type: m[1], code: m[2], href: new URL(href, location.origin).href };
+  // A shortcode-bearing path is EXACTLY /keyword/code/ - nothing before the
+  // keyword, nothing after the code. Unanchored matching used to accept
+  // decoys like /reels/audio/28220520900913430/ (captures "audio" as a fake
+  // "code") and /some_username/reels/, both of which are common near a
+  // reel's action buttons and neither of which identifies the reel itself.
+  const SHORTCODE_RE = /^\/(p|reel|reels|tv)\/([^/?#]+)\/?(?:[?#].*)?$/;
+
+  // Picks the post/reel permalink that's visually closest on screen to
+  // whatever was clicked, rather than trusting DOM nesting (the permalink
+  // isn't always a descendant of the nearest "post" wrapper). Falls back to
+  // location.pathname, which Instagram keeps in sync with whichever reel is
+  // centered on the Reels feed even though that feed exposes no per-item
+  // permalink anchor at all - confirmed live: DcwsOejx9jI -> DcqjoKYSZUG ->
+  // DcxVoNwBrgV -> Dcv76S6ld2j as the user scrolled.
+  function findShortcodeInfo(container, triggerEl) {
+    const refEl = triggerEl || container;
+    const refRect = refEl ? refEl.getBoundingClientRect() : null;
+    const anchors = document.querySelectorAll(
+      'a[href*="/p/"], a[href*="/reel/"], a[href*="/reels/"], a[href*="/tv/"]'
+    );
+    let best = null;
+    let bestDist = Infinity;
+    for (const a of anchors) {
+      const href = a.getAttribute("href");
+      const m = href && href.match(SHORTCODE_RE);
+      if (!m) continue;
+      const r = a.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) continue; // not rendered on screen
+      const dist = refRect
+        ? Math.abs((r.top + r.bottom) / 2 - (refRect.top + refRect.bottom) / 2)
+        : 0;
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = { type: m[1], code: m[2], href: new URL(href, location.origin).href };
       }
     }
-    const m2 = location.pathname.match(/\/(p|reel|reels|tv)\/([^/]+)/);
+    if (best) return best;
+    const m2 = location.pathname.match(SHORTCODE_RE);
     if (m2) return { type: m2[1], code: m2[2], href: location.href };
     return null;
   }
@@ -175,7 +231,13 @@
   function findVideoContainer(fromEl) {
     let node = fromEl;
     for (let i = 0; i < 14 && node; i++) {
-      if (node.querySelector && node.querySelector("video")) return node;
+      if (node.querySelector) {
+        // More than one Save button means this ancestor has widened past the
+        // current post into a wrapper shared with neighboring posts - stop
+        // here rather than returning a video that belongs to one of them.
+        if (node.querySelectorAll('svg[aria-label="Save"]').length > 1) return null;
+        if (node.querySelector("video")) return node;
+      }
       node = node.parentElement;
     }
     return null;
@@ -273,7 +335,7 @@
 
   async function onDownloadClick(triggerEl, container) {
     removePanel();
-    const info = findShortcodeInfo(container);
+    const info = findShortcodeInfo(container, triggerEl);
     if (!info) {
       alert("IG Video Downloader: could not identify this post.");
       return;
