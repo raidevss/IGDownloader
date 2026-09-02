@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4F46E5"/>
+      <stop offset="50%" stop-color="#C026D3"/>
+      <stop offset="100%" stop-color="#F97316"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.10"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1200" height="300" rx="28" fill="url(#bg)"/>
+  <rect width="1200" height="300" rx="28" fill="url(#sheen)"/>
+
+  <circle cx="150" cy="150" r="230" fill="url(#glow)"/>
+  <circle cx="1060" cy="60" r="140" fill="url(#glow)"/>
+
+  <!-- icon badge -->
+  <g transform="translate(72, 90)">
+    <rect width="120" height="120" rx="30" fill="#ffffff" fill-opacity="0.16"/>
+    <rect x="1.5" y="1.5" width="117" height="117" rx="28.5" fill="none" stroke="#ffffff" stroke-opacity="0.35" stroke-width="1.5"/>
+    <g stroke="#ffffff" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" fill="none">
+      <line x1="60" y1="30" x2="60" y2="76"/>
+      <polyline points="38,54 60,76 82,54"/>
+      <line x1="34" y1="94" x2="86" y2="94"/>
+    </g>
+  </g>
+
+  <!-- title -->
+  <text x="230" y="150" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="52" font-weight="700" fill="#ffffff">IG Video Downloader</text>
+  <text x="231" y="188" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="21" font-weight="400" fill="#ffffff" fill-opacity="0.92">Save Instagram videos &amp; reels in your pick of quality, in one click</text>
+
+  <!-- badges -->
+  <g font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="15" font-weight="600" fill="#ffffff">
+    <g transform="translate(231, 216)">
+      <rect width="176" height="34" rx="17" fill="#ffffff" fill-opacity="0.16"/>
+      <text x="18" y="23">100% local, no servers</text>
+    </g>
+    <g transform="translate(419, 216)">
+      <rect width="150" height="34" rx="17" fill="#ffffff" fill-opacity="0.16"/>
+      <text x="18" y="23">Manifest V3</text>
+    </g>
+    <g transform="translate(581, 216)">
+      <rect width="176" height="34" rx="17" fill="#ffffff" fill-opacity="0.16"/>
+      <text x="18" y="23">Free &amp; open source</text>
+    </g>
+  </g>
+</svg>
